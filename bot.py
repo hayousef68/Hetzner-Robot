@@ -989,11 +989,17 @@ TERM_KB = [
      B("^Z", callback_data="x:t:z"), B("Tab", callback_data="x:t:tab")],
     [B("↑", callback_data="x:t:up"), B("↓", callback_data="x:t:down"), B("←", callback_data="x:t:left"),
      B("→", callback_data="x:t:right"), B("Esc", callback_data="x:t:esc")],
+    [B("^X", callback_data="x:t:x"), B("^O", callback_data="x:t:o"), B("^A", callback_data="x:t:a"),
+     B("^E", callback_data="x:t:e"), B("^L", callback_data="x:t:l")],
+    [B("Home", callback_data="x:t:home"), B("End", callback_data="x:t:end"),
+     B("PgUp", callback_data="x:t:pgup"), B("PgDn", callback_data="x:t:pgdn"), B("Del", callback_data="x:t:del")],
     [B("📜 Snippets", callback_data="x:snip"), B("🔄", callback_data="x:t:refresh"),
      B("❌ بستن", callback_data="x:close")],
 ]
 KEYMAP = {"enter": "\r", "c": "\x03", "d": "\x04", "z": "\x1a", "tab": "\t", "esc": "\x1b",
-          "up": "\x1b[A", "down": "\x1b[B", "right": "\x1b[C", "left": "\x1b[D"}
+          "up": "\x1b[A", "down": "\x1b[B", "right": "\x1b[C", "left": "\x1b[D",
+          "x": "\x18", "o": "\x0f", "a": "\x01", "e": "\x05", "l": "\x0c",
+          "home": "\x1b[H", "end": "\x1b[F", "pgup": "\x1b[5~", "pgdn": "\x1b[6~", "del": "\x1b[3~"}
 
 
 def render(s):
