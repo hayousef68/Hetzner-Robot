@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Hetzner Cloud Manager - Telegram Bot (With Termius-like SSH & SFTP)
+Hetzner Cloud Manager - Telegram Bot
 Env vars (set by install.sh):
   BOT_TOKEN   توکن ربات تلگرام
   ADMIN_IDS   آیدی عددی ادمین‌ها (با کاما)
@@ -9,22 +9,22 @@ Env vars (set by install.sh):
 """
 import asyncio
 import html
-import io
 import json
 import logging
 import os
-import posixpath
 import re
-import shlex
-import stat
-import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 
-import asyncssh
 import httpx
+import asyncssh
+import pyte
+import secrets
+import io
+import stat as pystat
+from cryptography.fernet import Fernet
 from telegram import InlineKeyboardButton as B, InlineKeyboardMarkup as KM, Update
-from telegram.error import BadRequest
+from telegram.error import BadRequest, RetryAfter
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ContextTypes, MessageHandler, filters)
 
@@ -79,10 +79,8 @@ class Hetzner:
 
 DATA_DIR = os.environ.get("DATA_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 PFILE = os.path.join(DATA_DIR, "projects.json")
-SFILE = os.path.join(DATA_DIR, "ssh_vault.json")
 APIS = {}
 TOKENS = {}
-SSH_VAULT = {}
 
 
 def load_projects():
@@ -102,34 +100,7 @@ def save_projects():
         json.dump(TOKENS, f)
 
 
-def load_ssh():
-    global SSH_VAULT
-    try:
-        with open(SFILE, encoding="utf-8") as f:
-            SSH_VAULT = json.load(f)
-    except FileNotFoundError:
-        SSH_VAULT = {}
-
-
-def save_ssh():
-    os.makedirs(DATA_DIR, exist_ok=True)
-    fd = os.open(SFILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(SSH_VAULT, f)
-
-
-def save_srv_pass(sid, password):
-    if not password:
-        return
-    sid = str(sid)
-    cfg = SSH_VAULT.get(sid, {"user": "root", "port": 22})
-    cfg["password"] = password
-    SSH_VAULT[sid] = cfg
-    save_ssh()
-
-
 load_projects()
-load_ssh()
 
 
 def proj(c):
@@ -184,11 +155,10 @@ async def show(u, text, rows=None):
     q = u.callback_query
     try:
         if q:
-            await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb,
-                                      disable_web_page_preview=True)
-        else:
-            await u.effective_message.reply_text(text, parse_mode="HTML", reply_markup=kb,
-                                                 disable_web_page_preview=True)
+            return await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb,
+                                             disable_web_page_preview=True)
+        return await u.effective_message.reply_text(text, parse_mode="HTML", reply_markup=kb,
+                                                    disable_web_page_preview=True)
     except BadRequest as ex:
         if "not modified" not in str(ex).lower():
             raise
@@ -206,310 +176,6 @@ def grid(items, prefix, per=2, width=30):
     return rows
 
 
-# ---------------------------------------------------------------- SSH & SFTP (Termius Module)
-SNIPPETS = {
-    "sys": ("📊 منابع سیستم", "uptime && echo '---' && free -h && echo '---' && df -h /"),
-    "top": ("🔥 پردازش‌های سنگین", "ps aux --sort=-%cpu | head -n 11"),
-    "dock": ("🐳 کانتینرهای Docker", "docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'"),
-    "ports": ("🌐 پورت‌های باز", "ss -tulpn | grep LISTEN"),
-    "net": ("📡 تست شبکه و پینگ", "ip -br a && echo '---' && ping -c 2 1.1.1.1"),
-    "apt": ("🔄 آپدیت پکیج‌ها", "DEBIAN_FRONTEND=noninteractive apt-get update && apt-get upgrade -y"),
-}
-
-
-def get_ssh_state(c, sid):
-    sid = str(sid)
-    ss = c.user_data.setdefault("ssh_state", {})
-    if sid not in ss:
-        ss[sid] = {"cwd": "/root", "ip": None, "name": f"#{sid}"}
-    return ss[sid]
-
-
-async def connect_ssh(c, sid):
-    sid = str(sid)
-    st = get_ssh_state(c, sid)
-    if not st.get("ip") or st["ip"] == "—":
-        s = (await api(c).req("GET", f"/servers/{sid}"))["server"]
-        st["ip"] = ip4(s)
-        st["name"] = s["name"]
-    if st["ip"] == "—":
-        raise HErr("این سرور IPv4 عمومی ندارد.")
-
-    cfg = SSH_VAULT.get(sid, {})
-    user = cfg.get("user", "root")
-    port = int(cfg.get("port", 22))
-    password = cfg.get("password")
-    pkey_str = cfg.get("pkey") or SSH_VAULT.get("_bot_key")
-
-    client_keys = []
-    if pkey_str:
-        try:
-            client_keys.append(asyncssh.import_private_key(pkey_str))
-        except Exception:
-            pass
-
-    kw = {
-        "host": st["ip"],
-        "port": port,
-        "username": user,
-        "known_hosts": None,
-        "connect_timeout": 10,
-    }
-    if password:
-        kw["password"] = password
-    if client_keys:
-        kw["client_keys"] = client_keys
-
-    return await asyncssh.connect(**kw)
-
-
-def term_kb(sid):
-    return [
-        [B("📂 فایل‌منیجر (SFTP)", callback_data=f"sf:{sid}"),
-         B("⚡ اسنیپت‌های آماده", callback_data=f"sn:{sid}")],
-        [B("📥 دانلود با مسیر", callback_data=f"sdl:{sid}"),
-         B("🔑 تنظیمات اتصال SSH", callback_data=f"sc:{sid}")],
-        [B("🧹 پاکسازی مسیر (cd ~)", callback_data=f"scd:{sid}"),
-         B("🔌 خروج از ترمینال", callback_data=f"s:{sid}")],
-    ]
-
-
-async def ssh_home(u, c, sid):
-    sid = str(sid)
-    s = (await api(c).req("GET", f"/servers/{sid}"))["server"]
-    st = get_ssh_state(c, sid)
-    st["ip"] = ip4(s)
-    st["name"] = s["name"]
-
-    cfg = SSH_VAULT.get(sid, {})
-    has_auth = bool(cfg.get("password") or cfg.get("pkey") or SSH_VAULT.get("_bot_key"))
-
-    c.user_data["await"] = {"kind": "ssh_cmd", "id": sid}
-    auth_badge = "✅ آماده اتصال" if has_auth else "⚠️ نیازمند تنظیم پسورد/کلید"
-
-    txt = (
-        f"💻 <b>ترمینال SSH (Termius)</b> — <b>{e(st['name'])}</b>\n"
-        f"🌐 آدرس: <code>{e(cfg.get('user', 'root'))}@{e(st['ip'])}:{cfg.get('port', 22)}</code>\n"
-        f"🔐 وضعیت احراز هویت: {auth_badge}\n"
-        f"📁 مسیر فعلی: <code>{e(st['cwd'])}</code>\n\n"
-        f"⌨️ <b>حالت ترمینال فعال است:</b>\n"
-        f"• هر دستوری بنویسی مستقیماً در مسیر <code>{e(st['cwd'])}</code> اجرا می‌شود.\n"
-        f"• هر فایلی در تلگرام بفرستی مستقیماً در همین پوشه آپلود می‌شود."
-    )
-    await show(u, txt, term_kb(sid))
-
-
-async def ssh_exec_and_reply(u, c, sid, cmd):
-    sid = str(sid)
-    st = get_ssh_state(c, sid)
-    c.user_data["await"] = {"kind": "ssh_cmd", "id": sid}
-
-    msg = u.effective_message
-    wait_msg = await msg.reply_text(f"⏳ <code>$ {e(cmd)}</code>", parse_mode="HTML")
-
-    marker = f"__CWD_{int(time.time())}__"
-    wrapped = f"cd {shlex.quote(st['cwd'])} 2>/dev/null || cd /; {cmd}; echo ''; echo '{marker}'; pwd"
-
-    try:
-        async with await connect_ssh(c, sid) as conn:
-            res = await asyncio.wait_for(conn.run(wrapped, check=False), timeout=60)
-    except asyncio.TimeoutError:
-        return await wait_msg.edit_text("⏱ زمان اجرای دستور بیش از ۶۰ ثانیه شد (Timeout).",
-                                        reply_markup=KM(term_kb(sid)))
-    except Exception as ex:
-        return await wait_msg.edit_text(
-            f"❌ <b>خطای اتصال SSH:</b>\n<code>{e(ex)}</code>\n\n"
-            f"از بخش «🔑 تنظیمات اتصال SSH» پسورد یا کلید سرور را بررسی کن.",
-            parse_mode="HTML", reply_markup=KM(term_kb(sid)))
-
-    out = (res.stdout or "") + (f"\n[stderr]\n{res.stderr}" if res.stderr else "")
-    if marker in out:
-        parts = out.rsplit(marker, 1)
-        out = parts[0].rstrip()
-        new_cwd = parts[1].strip().splitlines()
-        if new_cwd:
-            st["cwd"] = new_cwd[-1].strip()
-
-    if not out.strip():
-        out = "(بدون خروجی)"
-
-    header = f"💻 <b>{e(st['name'])}</b>:<code>{e(st['cwd'])}</code>\n<code>$ {e(cmd)}</code>\n\n"
-    if len(out) > 3500:
-        await wait_msg.delete()
-        bio = io.BytesIO(out.encode("utf-8", errors="replace"))
-        bio.name = f"output-{sid}.txt"
-        await msg.reply_document(
-            document=bio,
-            caption=f"{header}📄 خروجی طولانی بود و در قالب فایل ارسال شد.",
-            parse_mode="HTML",
-            reply_markup=KM(term_kb(sid))
-        )
-    else:
-        await wait_msg.edit_text(
-            f"{header}<pre>{e(out)}</pre>",
-            parse_mode="HTML",
-            reply_markup=KM(term_kb(sid))
-        )
-
-
-async def ssh_config_menu(u, c, sid):
-    sid = str(sid)
-    cfg = SSH_VAULT.get(sid, {})
-    has_pw = "✅ ثبت شده" if cfg.get("password") else "❌ ندارد"
-    has_pk = "✅ ثبت شده" if cfg.get("pkey") else ("🔑 کلید عمومی ربات" if SSH_VAULT.get("_bot_key") else "❌ ندارد")
-    txt = (
-        f"🔑 <b>تنظیمات اتصال SSH سرور #{sid}</b>\n"
-        f"👤 کاربر: <code>{e(cfg.get('user', 'root'))}</code>\n"
-        f"🔌 پورت: <code>{cfg.get('port', 22)}</code>\n"
-        f"🔒 پسورد: {has_pw}\n"
-        f"🗝 کلید خصوصی: {has_pk}"
-    )
-    rows = [
-        [B("🔒 تنظیم پسورد", callback_data=f"sc_pw:{sid}"),
-         B("🗝 ارسال کلید خصوصی (Private Key)", callback_data=f"sc_pk:{sid}")],
-        [B("👤 تغییر یوزر و پورت", callback_data=f"sc_up:{sid}")],
-        [B("⚡ ساخت و ثبت کلید خودکار ربات در هتزنر", callback_data=f"sc_gen:{sid}")],
-        back(f"ssh:{sid}", "↩️ بازگشت به ترمینال"),
-    ]
-    await show(u, txt, rows)
-
-
-async def ssh_gen_bot_key(u, c, sid):
-    key = asyncssh.generate_private_key("ssh-ed25519")
-    priv = key.export_private_key().decode("utf-8")
-    pub = key.export_public_key().decode("utf-8").strip()
-    SSH_VAULT["_bot_key"] = priv
-    save_ssh()
-    try:
-        await api(c).req("POST", "/ssh_keys", json={"name": f"hbot-auto-{int(time.time())}", "public_key": pub})
-        msg = "✅ کلید اختصاصی ربات ساخته شد و در SSH Keys اکانت هتزنر ثبت گردید!\n\n"
-    except HErr as ex:
-        msg = f"✅ کلید ساخته شد (خطا در ثبت خودکار هتزنر: {e(ex)}).\n\n"
-    msg += f"برای افزودن به سرورهای فعلی، این دستور را یک‌بار در سرور اجرا کن:\n<code>mkdir -p ~/.ssh && echo '{e(pub)}' >> ~/.ssh/authorized_keys</code>"
-    await show(u, msg, [back(f"sc:{sid}")])
-
-
-async def sftp_browser(u, c, sid):
-    sid = str(sid)
-    st = get_ssh_state(c, sid)
-    c.user_data["await"] = {"kind": "ssh_cmd", "id": sid}
-    await show(u, f"⏳ در حال خواندن فایل‌های <code>{e(st['cwd'])}</code> ...")
-    try:
-        async with await connect_ssh(c, sid) as conn:
-            async with conn.start_sftp_client() as sftp:
-                items = await sftp.readdir(st["cwd"])
-    except Exception as ex:
-        return await show(u, f"❌ خطای SFTP:\n<code>{e(ex)}</code>", [back(f"ssh:{sid}")])
-
-    dirs, files = [], []
-    for it in items:
-        name = it.filename
-        if name in (".", ".."):
-            continue
-        mode = it.attrs.permissions or 0
-        if stat.S_ISDIR(mode):
-            dirs.append(name)
-        else:
-            files.append((name, it.attrs.size or 0))
-
-    dirs.sort()
-    files.sort(key=lambda x: x[0])
-    st["sftp_dirs"] = dirs[:30]
-    st["sftp_files"] = [f[0] for f in files[:30]]
-
-    rows = []
-    if st["cwd"] != "/":
-        rows.append([B("⬆️ پوشه بالاتر (..)", callback_data=f"sfd:{sid}:..")])
-
-    for idx, d in enumerate(st["sftp_dirs"]):
-        rows.append([B(f"📁 {d}/", callback_data=f"sfd:{sid}:{idx}")])
-
-    for idx, (fname, fsize) in enumerate(files[:30]):
-        rows.append([
-            B(f"📄 {fname[:22]} ({hb(fsize)})", callback_data=f"sff:{sid}:{idx}"),
-            B("🗑", callback_data=f"sfrm:{sid}:{idx}")
-        ])
-
-    rows.append([B("🔄 رفرش", callback_data=f"sf:{sid}"),
-                 B("💻 بازگشت به ترمینال", callback_data=f"ssh:{sid}")])
-
-    txt = (
-        f"📂 <b>فایل‌منیجر SFTP</b> — <b>{e(st['name'])}</b>\n"
-        f"📍 مسیر: <code>{e(st['cwd'])}</code>\n\n"
-        f"• برای <b>دانلود</b> روی نام فایل بزن.\n"
-        f"• برای <b>آپلود در این پوشه</b>، کافیست فایل را همین‌جا در چت بفرستی!"
-    )
-    await show(u, txt, rows)
-
-
-async def sftp_download_file(u, c, sid, remote_path):
-    sid = str(sid)
-    msg = u.effective_message
-    wait_msg = await msg.reply_text(f"📥 در حال دریافت <code>{e(remote_path)}</code> از سرور ...", parse_mode="HTML")
-    try:
-        async with await connect_ssh(c, sid) as conn:
-            async with conn.start_sftp_client() as sftp:
-                st_attr = await sftp.stat(remote_path)
-                if (st_attr.size or 0) > 49 * 1024 * 1024:
-                    return await wait_msg.edit_text("❌ حجم فایل بیشتر از محدودیت ۵۰ مگابایت بات تلگرام است.")
-                with tempfile.NamedTemporaryFile(delete=False) as tf:
-                    tmp_path = tf.name
-                await sftp.get(remote_path, tmp_path)
-        await wait_msg.delete()
-        with open(tmp_path, "rb") as f:
-            await msg.reply_document(
-                document=f,
-                filename=posixpath.basename(remote_path),
-                caption=f"📥 <code>{e(remote_path)}</code>",
-                parse_mode="HTML"
-            )
-        os.remove(tmp_path)
-    except Exception as ex:
-        await wait_msg.edit_text(f"❌ خطا در دانلود فایل:\n<code>{e(ex)}</code>", parse_mode="HTML")
-
-
-async def on_document(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    if not ok(u):
-        return
-    st_await = c.user_data.get("await") or {}
-    if st_await.get("kind") not in ("ssh_cmd", "ssh_pkey"):
-        return
-
-    sid = st_await["id"]
-    doc = u.message.document
-
-    if st_await.get("kind") == "ssh_pkey":
-        f = await doc.get_file()
-        raw = await f.download_as_bytearray()
-        cfg = SSH_VAULT.get(str(sid), {"user": "root", "port": 22})
-        cfg["pkey"] = raw.decode("utf-8", errors="replace")
-        SSH_VAULT[str(sid)] = cfg
-        save_ssh()
-        c.user_data.pop("await", None)
-        return await show(u, "✅ کلید خصوصی با موفقیت ذخیره شد.", [back(f"sc:{sid}")])
-
-    st = get_ssh_state(c, sid)
-    remote_path = posixpath.join(st["cwd"], doc.file_name)
-    wait_msg = await u.message.reply_text(f"📤 در حال آپلود به <code>{e(remote_path)}</code> ...", parse_mode="HTML")
-    try:
-        tg_file = await doc.get_file()
-        with tempfile.NamedTemporaryFile(delete=False) as tf:
-            tmp_path = tf.name
-        await tg_file.download_to_drive(tmp_path)
-
-        async with await connect_ssh(c, sid) as conn:
-            async with conn.start_sftp_client() as sftp:
-                await sftp.put(tmp_path, remote_path)
-        os.remove(tmp_path)
-        await wait_msg.edit_text(
-            f"✅ فایل با موفقیت در سرور آپلود شد!\n📍 مسیر: <code>{e(remote_path)}</code>",
-            parse_mode="HTML",
-            reply_markup=KM(term_kb(sid))
-        )
-    except Exception as ex:
-        await wait_msg.edit_text(f"❌ خطا در آپلود SFTP:\n<code>{e(ex)}</code>", parse_mode="HTML")
-
-
 # ---------------------------------------------------------------- menu
 async def menu(u, c):
     c.user_data.pop("await", None)
@@ -517,11 +183,11 @@ async def menu(u, c):
         return await show(u, "👋 <b>خوش اومدی!</b>\nبرای شروع باید اکانت هتزنر را به ربات وصل کنی (فقط دو مرحله).",
                           [[B("🔗 اتصال اکانت هتزنر", callback_data="pa")]])
     rows = [
-        [B("🖥 سرورها (و ترمینال SSH)", callback_data="m:srv"), B("➕ ساخت سرور", callback_data="cs")],
+        [B("🖥 سرورها", callback_data="m:srv"), B("➕ ساخت سرور", callback_data="cs")],
         [B("📸 Snapshot/Backup", callback_data="m:img"), B("🔑 SSH Keys", callback_data="m:key")],
         [B("🛡 Firewall", callback_data="m:fw"), B("💾 Volume", callback_data="m:vol")],
         [B("🌐 Floating IP", callback_data="m:fip"), B("🔗 Network/LB/IP", callback_data="m:misc")],
-        [B("📁 پروژه‌ها", callback_data="m:proj")],
+        [B("💻 SSH / ترمینال", callback_data="x:menu"), B("📁 پروژه‌ها", callback_data="m:proj")],
     ]
     await show(u, f"🤖 <b>مدیریت Hetzner</b>\nپروژه فعال: <b>{e(proj(c))}</b>", rows)
 
@@ -537,15 +203,13 @@ async def proj_menu(u, c):
 # ---------------------------------------------------------------- servers
 async def srv_list(u, c):
     ss = await api(c).paged("/servers", "servers")
-    rows = [[B(f"{st_icon(s['status'])} {s['name']} · {ip4(s)}", callback_data=f"s:{s['id']}"),
-             B("💻 SSH", callback_data=f"ssh:{s['id']}")] for s in ss]
+    rows = [[B(f"{st_icon(s['status'])} {s['name']} · {ip4(s)}", callback_data=f"s:{s['id']}")] for s in ss]
     rows.append([B("➕ ساخت سرور", callback_data="cs")])
     rows.append(HOME)
     await show(u, f"🖥 سرورها ({len(ss)})", rows)
 
 
 async def srv_view(u, c, sid):
-    c.user_data.pop("await", None)
     s = (await api(c).req("GET", f"/servers/{sid}"))["server"]
     pn = s.get("public_net") or {}
     t = s["server_type"]
@@ -567,8 +231,6 @@ async def srv_view(u, c, sid):
     )
     i = sid
     rows = [
-        [B("💻 ترمینال SSH (Termius)", callback_data=f"ssh:{i}"),
-         B("📂 مدیریت فایل SFTP", callback_data=f"sf:{i}")],
         [B("▶️ روشن", callback_data=f"a:{i}:poweron"), B("⏻ خاموش (نرم)", callback_data=f"y:{i}:shutdown"),
          B("⛔ خاموش (اجباری)", callback_data=f"y:{i}:poweroff")],
         [B("🔄 ریبوت", callback_data=f"y:{i}:reboot"), B("⚡ ریست سخت", callback_data=f"y:{i}:reset")],
@@ -581,6 +243,7 @@ async def srv_view(u, c, sid):
            callback_data=f"y:{i}:" + ("disable_backup" if s.get("backup_window") else "enable_backup"))],
         [B("✏️ تغییر نام", callback_data=f"rn:{i}"), B("📊 متریک", callback_data=f"mt:{i}"),
          B("🔒 Protection", callback_data=f"a:{i}:protect")],
+        [B("💻 SSH / ترمینال", callback_data=f"x:srv:{i}")],
         [B("🔃 رفرش", callback_data=f"s:{i}"), B("🗑 حذف", callback_data=f"y:{i}:delete")],
         back("m:srv", "↩️ لیست سرورها"),
     ]
@@ -607,11 +270,9 @@ async def do_action(u, c, sid, act):
     elif act == "reset_password":
         r = await h.req("POST", base + "reset_password")
         await h.wait(r["action"]["id"], 60)
-        save_srv_pass(sid, r.get("root_password"))
-        extra = f"\n🔑 پسورد جدید (در SSH هم ذخیره شد): <code>{e(r['root_password'])}</code>"
+        extra = f"\n🔑 پسورد جدید: <code>{e(r['root_password'])}</code>"
     elif act == "enable_rescue":
         r = await h.req("POST", base + "enable_rescue", json={"type": "linux64"})
-        save_srv_pass(sid, r.get("root_password"))
         extra = f"\n🛟 پسورد Rescue: <code>{e(r['root_password'])}</code>\nبرای ورود، سرور را ریست سخت کن."
     elif act == "disable_rescue":
         await h.req("POST", base + "disable_rescue")
@@ -628,8 +289,6 @@ async def do_action(u, c, sid, act):
         await h.wait(r["action"]["id"], 30)
     elif act == "delete":
         await h.req("DELETE", f"/servers/{sid}")
-        SSH_VAULT.pop(str(sid), None)
-        save_ssh()
         await show(u, "🗑 سرور حذف شد.", [back("m:srv", "↩️ لیست سرورها")])
         return
     if extra:
@@ -780,10 +439,8 @@ async def new_go(u, c):
     txt = (f"🎉 سرور ساخته شد!\n<b>{e(s['name'])}</b>\nIPv4: <code>{e(ip4(s))}</code>\n"
            f"IPv6: <code>{e(((s.get('public_net') or {}).get('ipv6') or {}).get('ip', '—'))}</code>")
     if r.get("root_password"):
-        save_srv_pass(s["id"], r["root_password"])
-        txt += f"\n🔑 root (ذخیره شده در SSH): <code>{e(r['root_password'])}</code>"
-    await show(u, txt, [[B("💻 ورود به SSH", callback_data=f"ssh:{s['id']}"),
-                         B("🖥 مدیریت سرور", callback_data=f"s:{s['id']}")], HOME])
+        txt += f"\n🔑 root: <code>{e(r['root_password'])}</code>"
+    await show(u, txt, [[B("🖥 مدیریت سرور", callback_data=f"s:{s['id']}")], HOME])
 
 
 # ---------------------------------------------------------------- images
@@ -914,10 +571,12 @@ RES = {"k": ("ssh_keys", "SSH Key", "m:key"), "f": ("firewalls", "Firewall", "m:
 
 # ---------------------------------------------------------------- router
 async def route(u, c, k, a):
-    if not APIS and not (k == "pa" or (k == "m" and a[0] in ("menu", "proj"))):
+    if not APIS and not (k in ("pa", "x") or (k == "m" and a[0] in ("menu", "proj"))):
         return await menu(u, c)
     h = api(c) if APIS else None
-    if k == "pa":
+    if k == "x":
+        await ssh_route(u, c, a)
+    elif k == "pa":
         c.user_data["await"] = {"kind": "pname"}
         await show(u, "🔗 <b>مرحله ۱ از ۲</b>\nیک اسم دلخواه برای این اکانت/پروژه بفرست (انگلیسی، مثلاً <code>main</code>):",
                    [HOME])
@@ -938,70 +597,6 @@ async def route(u, c, k, a):
     elif k == "pj":
         c.user_data["proj"] = list(APIS)[int(a[0])]
         await menu(u, c)
-    # --- SSH & SFTP routes
-    elif k == "ssh":
-        await ssh_home(u, c, a[0])
-    elif k == "scd":
-        get_ssh_state(c, a[0])["cwd"] = "/root"
-        await ssh_home(u, c, a[0])
-    elif k == "sc":
-        await ssh_config_menu(u, c, a[0])
-    elif k == "sc_pw":
-        c.user_data["await"] = {"kind": "ssh_pw", "id": a[0]}
-        await show(u, "🔒 پسورد SSH سرور را بفرست (پیام تو بلافاصله حذف می‌شود):", [back(f"sc:{a[0]}")])
-    elif k == "sc_pk":
-        c.user_data["await"] = {"kind": "ssh_pkey", "id": a[0]}
-        await show(u, "🗝 متن کلید خصوصی (<code>-----BEGIN OPENSSH PRIVATE KEY-----</code>) را بفرست یا فایل آن را آپلود کن:",
-                   [back(f"sc:{a[0]}")])
-    elif k == "sc_up":
-        c.user_data["await"] = {"kind": "ssh_up", "id": a[0]}
-        await show(u, "👤 یوزر و پورت را به فرمت <code>user:port</code> بفرست (مثلاً <code>root:22</code> یا <code>ubuntu:2222</code>):",
-                   [back(f"sc:{a[0]}")])
-    elif k == "sc_gen":
-        await ssh_gen_bot_key(u, c, a[0])
-    elif k == "sn":
-        sid = a[0]
-        rows = [[B(title, callback_data=f"snr:{sid}:{key}")] for key, (title, _) in SNIPPETS.items()]
-        rows.append(back(f"ssh:{sid}", "↩️ بازگشت به ترمینال"))
-        await show(u, "⚡ <b>اسنیپت‌های آماده (Termius Snippets):</b>", rows)
-    elif k == "snr":
-        sid, key = a[0], a[1]
-        _, cmd = SNIPPETS[key]
-        await ssh_exec_and_reply(u, c, sid, cmd)
-    elif k == "sdl":
-        c.user_data["await"] = {"kind": "ssh_dlpath", "id": a[0]}
-        await show(u, "📥 مسیر کامل فایل روی سرور را بفرست (مثلاً <code>/etc/nginx/nginx.conf</code>):",
-                   [back(f"ssh:{a[0]}")])
-    elif k == "sf":
-        await sftp_browser(u, c, a[0])
-    elif k == "sfd":
-        sid, target = a[0], a[1]
-        st = get_ssh_state(c, sid)
-        if target == "..":
-            st["cwd"] = posixpath.dirname(st["cwd"].rstrip("/")) or "/"
-        else:
-            dname = st.get("sftp_dirs", [])[int(target)]
-            st["cwd"] = posixpath.join(st["cwd"], dname)
-        await sftp_browser(u, c, sid)
-    elif k == "sff":
-        sid, idx = a[0], int(a[1])
-        st = get_ssh_state(c, sid)
-        fname = st.get("sftp_files", [])[idx]
-        await sftp_download_file(u, c, sid, posixpath.join(st["cwd"], fname))
-    elif k == "sfrm":
-        sid, idx = a[0], int(a[1])
-        st = get_ssh_state(c, sid)
-        fname = st.get("sftp_files", [])[idx]
-        await confirm(u, f"حذف فایل {fname} از سرور", f"sfrmy:{sid}:{idx}", f"sf:{sid}")
-    elif k == "sfrmy":
-        sid, idx = a[0], int(a[1])
-        st = get_ssh_state(c, sid)
-        fname = st.get("sftp_files", [])[idx]
-        rpath = posixpath.join(st["cwd"], fname)
-        async with await connect_ssh(c, sid) as conn:
-            async with conn.start_sftp_client() as sftp:
-                await sftp.remove(rpath)
-        await sftp_browser(u, c, sid)
     # --- servers
     elif k == "s":
         await srv_view(u, c, a[0])
@@ -1034,8 +629,7 @@ async def route(u, c, k, a):
         await h.wait(r["action"]["id"], 240)
         txt = "✅ ریبیلد انجام شد."
         if r.get("root_password"):
-            save_srv_pass(a[0], r["root_password"])
-            txt += f"\n🔑 root (ذخیره شده در SSH): <code>{e(r['root_password'])}</code>"
+            txt += f"\n🔑 root: <code>{e(r['root_password'])}</code>"
         await show(u, txt, [back(f"s:{a[0]}", "↩️ سرور")])
     elif k == "rs":
         sid = a[0]
@@ -1201,6 +795,9 @@ async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
     except (KeyError, IndexError):
         log.exception("state error")
         await show(u, "❌ وضعیت منقضی شده، از اول شروع کن.", [HOME])
+    except Exception as ex:
+        log.exception("unexpected")
+        await show(u, f"❌ خطای غیرمنتظره:\n<code>{e(ex)}</code>", [HOME])
 
 
 # ---------------------------------------------------------------- text input
@@ -1209,41 +806,16 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return
     st = c.user_data.pop("await", None)
     if not st:
+        sess = SESS.get(u.effective_user.id)
+        if sess:
+            await term_input(u, c, sess)
         return
     kind, t = st["kind"], u.message.text.strip()
+    if kind in SSH_KINDS:
+        return await ssh_text(u, c, kind, st, u.message.text)
     h = api(c) if APIS else None
     try:
-        if kind == "ssh_cmd":
-            await ssh_exec_and_reply(u, c, st["id"], t)
-        elif kind == "ssh_pw":
-            try:
-                await u.message.delete()
-            except Exception:
-                pass
-            save_srv_pass(st["id"], t)
-            await ssh_config_menu(u, c, st["id"])
-        elif kind == "ssh_pkey":
-            try:
-                await u.message.delete()
-            except Exception:
-                pass
-            cfg = SSH_VAULT.get(str(st["id"]), {"user": "root", "port": 22})
-            cfg["pkey"] = u.message.text.strip() + "\n"
-            SSH_VAULT[str(st["id"])] = cfg
-            save_ssh()
-            await ssh_config_menu(u, c, st["id"])
-        elif kind == "ssh_up":
-            user, port = (t.split(":", 1) + ["22"])[:2]
-            cfg = SSH_VAULT.get(str(st["id"]), {})
-            cfg["user"] = user.strip() or "root"
-            cfg["port"] = int(port.strip())
-            SSH_VAULT[str(st["id"])] = cfg
-            save_ssh()
-            await ssh_config_menu(u, c, st["id"])
-        elif kind == "ssh_dlpath":
-            c.user_data["await"] = {"kind": "ssh_cmd", "id": st["id"]}
-            await sftp_download_file(u, c, st["id"], t)
-        elif kind == "pname":
+        if kind == "pname":
             if not re.fullmatch(r"[A-Za-z0-9_\-]{1,20}", t) or t in APIS:
                 c.user_data["await"] = st
                 return await show(u, "❌ اسم نامعتبر یا تکراری است (فقط انگلیسی/عدد/_/-). دوباره بفرست:")
@@ -1280,7 +852,7 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
             c.user_data["new"]["ud"] = t
             await new_confirm(u, c)
         elif kind == "rename":
-            await h.req("PUT", f"/servers/{st['id']}", json={"name": t})
+            r = await h.req("PUT", f"/servers/{st['id']}", json={"name": t})
             await srv_view(u, c, st["id"])
         elif kind == "keyname":
             c.user_data["await"] = {"kind": "keypub", "name": t}
@@ -1295,6 +867,7 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
             r = await h.req("POST", "/firewalls", json={"name": t, "rules": rules})
             await fw_view(u, c, r["firewall"]["id"])
         elif kind == "fwrules":
+            import json
             await h.req("POST", f"/firewalls/{st['id']}/actions/set_rules", json={"rules": json.loads(t)})
             await fw_view(u, c, st["id"])
         elif kind == "volname":
@@ -1315,6 +888,588 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await show(u, "❌ ورودی نامعتبر.", [HOME])
 
 
+# ================================================================ SSH / Terminal (Termius-like)
+COLS, ROWS = 56, 22
+IDLE_SECONDS = 1800
+SSH_FILE = os.path.join(DATA_DIR, "ssh.json")
+DEFAULT_SNIPPETS = [
+    {"name": "Update & Upgrade", "cmd": "apt update && apt upgrade -y"},
+    {"name": "Disk", "cmd": "df -h"},
+    {"name": "Memory", "cmd": "free -h"},
+    {"name": "Top CPU", "cmd": "ps aux --sort=-%cpu | head -n 10"},
+]
+DB = {"hosts": {}, "keys": {}, "snippets": list(DEFAULT_SNIPPETS)}
+SESS = {}
+_F = None
+
+
+def db_load():
+    try:
+        with open(SSH_FILE, encoding="utf-8") as f:
+            DB.update(json.load(f))
+    except FileNotFoundError:
+        pass
+
+
+def db_save():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    fd = os.open(SSH_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(DB, f)
+
+
+db_load()
+
+
+def fer():
+    global _F
+    if _F is None:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        kf = os.path.join(DATA_DIR, "enc.key")
+        if not os.path.exists(kf):
+            fd = os.open(kf, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(Fernet.generate_key())
+        with open(kf, "rb") as f:
+            _F = Fernet(f.read())
+    return _F
+
+
+def enc(s):
+    return fer().encrypt(s.encode()).decode()
+
+
+def dec(s):
+    return fer().decrypt(s.encode()).decode()
+
+
+class HostKeyChanged(Exception):
+    pass
+
+
+async def ssh_connect(hid):
+    h = DB["hosts"][hid]
+    kw = dict(host=h["host"], port=h["port"], username=h["user"], connect_timeout=15,
+              keepalive_interval=30, client_keys=None, config=[])
+    if h["auth"] == "password":
+        kw.update(password=dec(h["secret"]), preferred_auth=("password", "keyboard-interactive"))
+    else:
+        k = DB["keys"][h["key"]]
+        kw.update(client_keys=[asyncssh.import_private_key(dec(k["priv"]))], password=None,
+                  preferred_auth=("publickey",))
+    pat = h["host"] if h["port"] == 22 else f"[{h['host']}]:{h['port']}"
+    kw["known_hosts"] = asyncssh.import_known_hosts(f"{pat} {h['hostkey']}") if h.get("hostkey") else None
+    try:
+        conn = await asyncssh.connect(**kw)
+    except asyncssh.HostKeyNotVerifiable:
+        raise HostKeyChanged()
+    if not h.get("hostkey"):
+        key = getattr(conn, "get_server_host_key", None)
+        key = key() if key else conn._server_host_key
+        h["hostkey"] = key.export_public_key().decode().strip()
+        h["fp"] = key.get_fingerprint()
+        db_save()
+    return conn
+
+
+class Sess:
+    def __init__(s, bot, uid, hid, name, chat, mid, conn, proc):
+        s.bot, s.uid, s.hid, s.name, s.chat, s.mid, s.conn, s.proc = bot, uid, hid, name, chat, mid, conn, proc
+        s.screen = pyte.Screen(COLS, ROWS)
+        s.stream = pyte.Stream(s.screen)
+        s.dirty = s.closed = False
+        s.last = ""
+        s.last_in = time.time()
+        s.lock = asyncio.Lock()
+        s.tasks = []
+
+
+TERM_KB = [
+    [B("⏎", callback_data="x:t:enter"), B("^C", callback_data="x:t:c"), B("^D", callback_data="x:t:d"),
+     B("^Z", callback_data="x:t:z"), B("Tab", callback_data="x:t:tab")],
+    [B("↑", callback_data="x:t:up"), B("↓", callback_data="x:t:down"), B("←", callback_data="x:t:left"),
+     B("→", callback_data="x:t:right"), B("Esc", callback_data="x:t:esc")],
+    [B("📜 Snippets", callback_data="x:snip"), B("🔄", callback_data="x:t:refresh"),
+     B("❌ بستن", callback_data="x:close")],
+]
+KEYMAP = {"enter": "\r", "c": "\x03", "d": "\x04", "z": "\x1a", "tab": "\t", "esc": "\x1b",
+          "up": "\x1b[A", "down": "\x1b[B", "right": "\x1b[C", "left": "\x1b[D"}
+
+
+def render(s):
+    lines = [l.rstrip() for l in s.screen.display]
+    while lines and not lines[-1]:
+        lines.pop()
+    while True:
+        body = e("\n".join(lines)) or " "
+        out = f"<b>💻 {e(s.name)}</b>\n<pre>{body}</pre>"
+        if len(out) <= 3900 or len(lines) <= 1:
+            return out
+        lines = lines[1:]
+
+
+async def push(s, force=False):
+    async with s.lock:
+        txt = render(s)
+        if txt == s.last and not force:
+            return
+        try:
+            await s.bot.edit_message_text(chat_id=s.chat, message_id=s.mid, text=txt, parse_mode="HTML",
+                                          reply_markup=KM(TERM_KB))
+            s.last = txt
+        except BadRequest as ex:
+            if "not modified" in str(ex).lower():
+                s.last = txt
+            else:
+                log.warning("push: %s", ex)
+        except RetryAfter as ex:
+            await asyncio.sleep(ex.retry_after + 0.5)
+        except Exception:
+            log.exception("push failed")
+
+
+async def reader(s):
+    try:
+        while True:
+            d = await s.proc.stdout.read(4096)
+            if not d:
+                break
+            s.stream.feed(d)
+            s.dirty = True
+    except Exception:
+        pass
+    await term_close(s.uid, "🔌 ارتباط توسط سرور بسته شد")
+
+
+async def pump(s):
+    while not s.closed:
+        await asyncio.sleep(0.8)
+        if s.dirty:
+            s.dirty = False
+            await push(s)
+        if time.time() - s.last_in > IDLE_SECONDS:
+            await term_close(s.uid, "⏱ به‌خاطر عدم فعالیت (۳۰ دقیقه) بسته شد")
+            return
+
+
+async def term_close(uid, note="🔌 ارتباط بسته شد"):
+    s = SESS.pop(uid, None)
+    if not s:
+        return
+    s.closed = True
+    cur = asyncio.current_task()
+    for t in s.tasks:
+        if t is not cur:
+            t.cancel()
+    try:
+        s.proc.close()
+        s.conn.close()
+    except Exception:
+        pass
+    try:
+        await s.bot.edit_message_text(chat_id=s.chat, message_id=s.mid, text=render(s) + f"\n\n{note}",
+                                      parse_mode="HTML", reply_markup=KM([[B("💻 SSH", callback_data="x:menu")]]))
+    except Exception:
+        pass
+
+
+async def term_start(u, c, hid):
+    uid = u.effective_user.id
+    await term_close(uid)
+    h = DB["hosts"].get(hid)
+    if not h:
+        return await show(u, "❌ سرور پیدا نشد.", [back("x:menu")])
+    c.user_data.pop("await", None)
+    m = await show(u, f"⏳ اتصال به <b>{e(h['name'])}</b> ...")
+    mid = m.message_id if hasattr(m, "message_id") else u.callback_query.message.message_id
+    try:
+        conn = await ssh_connect(hid)
+        proc = await conn.create_process(term_type="xterm", term_size=(COLS, ROWS), encoding="utf-8",
+                                         errors="replace")
+    except HostKeyChanged:
+        return await show(u, "🚨 <b>کلید (fingerprint) سرور عوض شده!</b>\nاگر سرور را ریبیلد کرده‌ای عادی است؛ "
+                             "وگرنه ممکن است حمله MITM باشد. اتصال انجام نشد.",
+                          [[B("🔓 قبول کلید جدید", callback_data=f"x:rf:{hid}")], back("x:menu")])
+    except Exception as ex:
+        return await show(u, f"❌ اتصال ناموفق:\n<code>{e(ex)}</code>",
+                          [[B("🔁 تلاش دوباره", callback_data=f"x:c:{hid}")], back("x:menu")])
+    s = Sess(c.bot, uid, hid, h["name"], u.effective_chat.id, mid, conn, proc)
+    SESS[uid] = s
+    s.tasks = [asyncio.create_task(reader(s)), asyncio.create_task(pump(s))]
+    await asyncio.sleep(1)
+    await push(s, force=True)
+
+
+async def term_send(s, data):
+    s.proc.stdin.write(data)
+    s.last_in = time.time()
+    await asyncio.sleep(0.7)
+    await push(s)
+
+
+async def term_input(u, c, s):
+    raw = u.message.text
+    try:
+        await u.message.delete()
+    except Exception:
+        pass
+    m = re.fullmatch(r"\^([A-Za-z\[\]\\])", raw.strip())
+    data = chr(ord(m.group(1).upper()) - 64) if m else raw.replace("\n", "\r") + "\r"
+    await term_send(s, data)
+
+
+def gen_key(name):
+    k = asyncssh.generate_private_key("ssh-ed25519")
+    try:
+        k.set_comment("hetzner-bot")
+    except Exception:
+        pass
+    kid = secrets.token_hex(3)
+    DB["keys"][kid] = {"name": name, "priv": enc(k.export_private_key().decode()),
+                       "pub": k.export_public_key().decode().strip()}
+    db_save()
+    return kid
+
+
+async def ssh_menu(u, c):
+    s = SESS.get(u.effective_user.id)
+    rows = []
+    if s:
+        rows.append([B(f"🟢 بازگشت به ترمینال ({s.name})", callback_data="x:term")])
+    for hid, h in DB["hosts"].items():
+        rows.append([B(f"💻 {h['name']} · {h['host']}", callback_data=f"x:h:{hid}")])
+    rows += [[B("➕ سرور جدید", callback_data="x:ha"), B("🔑 کلیدها", callback_data="x:ks")],
+             [B("📜 Snippets", callback_data="x:sn"), B("⚡ اجرا روی چند سرور", callback_data="x:mx")], HOME]
+    await show(u, "💻 <b>SSH</b>\nترمینال زنده با دکمه‌های کنترلی، آپلود/دانلود فایل (SFTP)، Snippet و اجرای گروهی.", rows)
+
+
+async def host_view(u, c, hid):
+    h = DB["hosts"][hid]
+    auth = "🔐 پسورد" if h["auth"] == "password" else f"🔑 کلید ({e(DB['keys'].get(h.get('key'), {}).get('name', '?'))})"
+    fp = h.get("fp")
+    txt = (f"💻 <b>{e(h['name'])}</b>\n<code>{e(h['user'])}@{e(h['host'])}:{h['port']}</code>\n"
+           f"احراز هویت: {auth}\nFingerprint: <code>{e(fp) if fp else 'هنوز ثبت نشده (اولین اتصال ثبت می‌شود)'}</code>")
+    rows = [[B("🔌 اتصال", callback_data=f"x:c:{hid}")],
+            [B("🔓 ریست fingerprint", callback_data=f"x:rf:{hid}"), B("🗑 حذف", callback_data=f"x:hd:{hid}")],
+            back("x:menu")]
+    await show(u, txt, rows)
+
+
+async def ask_user(u, c):
+    c.user_data["await"] = {"kind": "huser"}
+    await show(u, "👤 یوزرنیم SSH را بفرست (یا دکمه root):", [[B("root", callback_data="x:hu:root")], HOME])
+
+
+async def ask_auth(u, c):
+    c.user_data.pop("await", None)
+    rows = [[B(f"🔑 {k['name']}", callback_data=f"x:au:k:{kid}")] for kid, k in DB["keys"].items()]
+    rows += [[B("✨ ساخت کلید جدید (پیشنهادی)", callback_data="x:au:gen")],
+             [B("📝 چسباندن Private Key", callback_data="x:au:paste")],
+             [B("🔐 پسورد", callback_data="x:au:pw")], HOME]
+    await show(u, "🔐 روش احراز هویت:", rows)
+
+
+async def save_host(u, c):
+    n = c.user_data.pop("nh")
+    hid = secrets.token_hex(3)
+    DB["hosts"][hid] = {"name": n["name"], "host": n["host"], "port": n["port"], "user": n["user"],
+                        "auth": n["auth"], "key": n.get("key"), "secret": n.get("secret"), "hostkey": None, "fp": None}
+    db_save()
+    extra = ""
+    rows = [[B("🔌 اتصال", callback_data=f"x:c:{hid}")], back("x:menu")]
+    if n.get("new_key"):
+        k = DB["keys"][n["key"]]
+        extra = (f"\n\n🔑 کلید عمومی ساخته‌شده:\n<code>{e(k['pub'])}</code>\n"
+                 "این کلید باید روی سرور در <code>~/.ssh/authorized_keys</code> باشد. "
+                 "برای سرورهای جدید، آن را به Hetzner اضافه کن و موقع ساخت سرور انتخابش کن.")
+        if APIS:
+            rows.insert(1, [B("➕ افزودن به Hetzner SSH Keys", callback_data=f"x:kh:{n['key']}")])
+    await show(u, f"✅ ذخیره شد: <b>{e(n['name'])}</b>{extra}", rows)
+
+
+async def ssh_text(u, c, kind, st, raw):
+    t = raw.strip()
+    try:
+        if kind == "hhost":
+            host, port = t, 22
+            if t.count(":") == 1:
+                host, p = t.split(":")
+                port = int(p)
+            if not host:
+                raise ValueError
+            c.user_data["nh"] = {"host": host, "port": port, "name": host}
+            await ask_user(u, c)
+        elif kind == "huser":
+            c.user_data["nh"]["user"] = t
+            await ask_auth(u, c)
+        elif kind in ("hpw", "hpaste", "kpaste"):
+            try:
+                await u.message.delete()
+            except Exception:
+                pass
+            if kind == "hpw":
+                n = c.user_data["nh"]
+                n.update(auth="password", secret=enc(raw))
+                await save_host(u, c)
+            else:
+                k = asyncssh.import_private_key(raw)
+                kid = secrets.token_hex(3)
+                DB["keys"][kid] = {"name": f"key-{kid}", "priv": enc(raw),
+                                   "pub": k.export_public_key().decode().strip()}
+                db_save()
+                if kind == "hpaste":
+                    n = c.user_data["nh"]
+                    n.update(auth="key", key=kid)
+                    await save_host(u, c)
+                else:
+                    await show(u, "✅ کلید ذخیره شد.", [back("x:ks")])
+        elif kind == "snname":
+            c.user_data["await"] = {"kind": "sncmd", "name": t}
+            await show(u, "حالا دستور را بفرست:")
+        elif kind == "sncmd":
+            DB["snippets"].append({"name": st["name"], "cmd": raw.strip()})
+            db_save()
+            await show(u, "✅ Snippet ذخیره شد.", [back("x:sn")])
+        elif kind == "mxcmd":
+            await run_multi(u, c, raw.strip())
+    except asyncssh.KeyImportError:
+        await show(u, "❌ کلید نامعتبر است (کلید با passphrase پشتیبانی نمی‌شود).", [back("x:menu")])
+    except ValueError:
+        await show(u, "❌ ورودی نامعتبر.", [back("x:menu")])
+
+
+async def run_multi(u, c, cmd):
+    sel = list(c.user_data.pop("mx", set()))
+    await show(u, f"⏳ اجرا روی {len(sel)} سرور ...")
+    sem = asyncio.Semaphore(5)
+    per = max(200, 3000 // max(1, len(sel)))
+
+    async def one(hid):
+        h = DB["hosts"][hid]
+        async with sem:
+            try:
+                conn = await ssh_connect(hid)
+                try:
+                    r = await conn.run(cmd, check=False, timeout=60)
+                    out = ((r.stdout or "") + (r.stderr or "")).strip()
+                    return f"<b>{e(h['name'])}</b> (exit {r.exit_status})\n<pre>{e(out[-per:]) or ' '}</pre>"
+                finally:
+                    conn.close()
+            except HostKeyChanged:
+                return f"<b>{e(h['name'])}</b> 🚨 fingerprint عوض شده"
+            except Exception as ex:
+                return f"<b>{e(h['name'])}</b> ❌ {e(str(ex)[:150])}"
+
+    res = await asyncio.gather(*(one(x) for x in sel))
+    await show(u, "\n\n".join(res), [back("x:menu")])
+
+
+async def ssh_route(u, c, a):
+    uid = u.effective_user.id
+    t, r = a[0], a[1:]
+    s = SESS.get(uid)
+    if t == "menu":
+        await ssh_menu(u, c)
+    elif t == "h":
+        await host_view(u, c, r[0])
+    elif t == "c":
+        await term_start(u, c, r[0])
+    elif t == "srv":
+        sv = (await api(c).req("GET", f"/servers/{r[0]}"))["server"]
+        ip = ip4(sv)
+        hid = next((i for i, h in DB["hosts"].items() if h["host"] == ip), None)
+        if hid:
+            await term_start(u, c, hid)
+        else:
+            c.user_data["nh"] = {"host": ip, "port": 22, "name": sv["name"]}
+            await ask_user(u, c)
+    elif t == "ha":
+        c.user_data["await"] = {"kind": "hhost"}
+        await show(u, "➕ آدرس سرور را بفرست (IP یا دامنه، اختیاری <code>:پورت</code>):", [back("x:menu")])
+    elif t == "hu":
+        c.user_data["nh"]["user"] = r[0]
+        await ask_auth(u, c)
+    elif t == "au":
+        n = c.user_data["nh"]
+        if r[0] == "k":
+            n.update(auth="key", key=r[1])
+            await save_host(u, c)
+        elif r[0] == "gen":
+            n.update(auth="key", key=gen_key(f"bot-{n['name']}"), new_key=True)
+            await save_host(u, c)
+        elif r[0] == "paste":
+            c.user_data["await"] = {"kind": "hpaste"}
+            await show(u, "📝 Private Key (بدون passphrase) را کامل بفرست.\n🔒 پیامت بعد از خواندن پاک می‌شود.",
+                       [HOME])
+        elif r[0] == "pw":
+            c.user_data["await"] = {"kind": "hpw"}
+            await show(u, "🔐 پسورد SSH را بفرست.\n🔒 پیامت بعد از خواندن پاک می‌شود و رمزنگاری‌شده ذخیره می‌شود.",
+                       [HOME])
+    elif t == "hd":
+        await confirm(u, f"حذف سرور «{DB['hosts'][r[0]]['name']}» از لیست SSH", f"x:hdy:{r[0]}", f"x:h:{r[0]}")
+    elif t == "hdy":
+        DB["hosts"].pop(r[0], None)
+        db_save()
+        await ssh_menu(u, c)
+    elif t == "rf":
+        DB["hosts"][r[0]]["hostkey"] = DB["hosts"][r[0]]["fp"] = None
+        db_save()
+        await host_view(u, c, r[0])
+    # --- keys
+    elif t == "ks":
+        rows = [[B(f"🔑 {k['name']}", callback_data=f"x:k:{kid}")] for kid, k in DB["keys"].items()]
+        rows += [[B("✨ ساخت کلید", callback_data="x:kg"), B("📝 چسباندن کلید", callback_data="x:kp")],
+                 back("x:menu")]
+        await show(u, "🔑 کلیدهای SSH (رمزنگاری‌شده ذخیره می‌شوند)", rows)
+    elif t == "kg":
+        kid = gen_key(f"key-{len(DB['keys']) + 1}")
+        await ssh_route(u, c, ["k", kid])
+    elif t == "kp":
+        c.user_data["await"] = {"kind": "kpaste"}
+        await show(u, "📝 Private Key را بفرست (پیامت پاک می‌شود):", [back("x:ks")])
+    elif t == "k":
+        k = DB["keys"][r[0]]
+        rows = ([[B("➕ افزودن به Hetzner", callback_data=f"x:kh:{r[0]}")]] if APIS else [])
+        rows += [[B("🗑 حذف", callback_data=f"x:kd:{r[0]}")], back("x:ks")]
+        await show(u, f"🔑 <b>{e(k['name'])}</b>\n<code>{e(k['pub'])}</code>", rows)
+    elif t == "kh":
+        k = DB["keys"][r[0]]
+        await api(c).req("POST", "/ssh_keys", json={"name": f"bot-{k['name']}", "public_key": k["pub"]})
+        await show(u, "✅ به SSH Keys هتزنر اضافه شد.", [back(f"x:k:{r[0]}")])
+    elif t == "kd":
+        await confirm(u, "حذف این کلید (سرورهایی که با آن تنظیم شده‌اند دیگر وصل نمی‌شوند)",
+                      f"x:kdy:{r[0]}", f"x:k:{r[0]}")
+    elif t == "kdy":
+        DB["keys"].pop(r[0], None)
+        db_save()
+        await ssh_route(u, c, ["ks"])
+    # --- snippets
+    elif t == "sn":
+        rows = [[B(f"📜 {x['name']}", callback_data=f"x:sd:{i}")] for i, x in enumerate(DB["snippets"])]
+        rows += [[B("➕ Snippet جدید", callback_data="x:sa")], back("x:menu")]
+        await show(u, "📜 Snippets (دستورهای ذخیره‌شده؛ داخل ترمینال با یک تپ اجرا می‌شوند)", rows)
+    elif t == "sa":
+        c.user_data["await"] = {"kind": "snname"}
+        await show(u, "نام Snippet را بفرست:", [back("x:sn")])
+    elif t == "sd":
+        x = DB["snippets"][int(r[0])]
+        await show(u, f"📜 <b>{e(x['name'])}</b>\n<code>{e(x['cmd'])}</code>",
+                   [[B("🗑 حذف", callback_data=f"x:sdy:{r[0]}")], back("x:sn")])
+    elif t == "sdy":
+        DB["snippets"].pop(int(r[0]))
+        db_save()
+        await ssh_route(u, c, ["sn"])
+    # --- multi run
+    elif t in ("mx", "mt"):
+        sel = c.user_data.setdefault("mx", set())
+        if t == "mt":
+            sel.symmetric_difference_update({r[0]})
+        rows = [[B(("✅ " if hid in sel else "⬜ ") + h["name"], callback_data=f"x:mt:{hid}")]
+                for hid, h in DB["hosts"].items()]
+        rows += [[B("▶️ ادامه", callback_data="x:mg")], back("x:menu")]
+        await show(u, "⚡ سرورهایی که می‌خواهی دستور رویشان اجرا شود:", rows)
+    elif t == "mg":
+        if not c.user_data.get("mx"):
+            return await ssh_route(u, c, ["mx"])
+        c.user_data["await"] = {"kind": "mxcmd"}
+        await show(u, "دستور را بفرست (حداکثر ۶۰ ثانیه، بدون حالت تعاملی):", [back("x:menu")])
+    # --- live terminal
+    elif t == "t":
+        if not s:
+            return await show(u, "⛔ نشستی باز نیست.", [[B("💻 SSH", callback_data="x:menu")]])
+        if r[0] == "refresh":
+            await push(s, force=True)
+        else:
+            await term_send(s, KEYMAP[r[0]])
+    elif t == "close":
+        await term_close(uid, "🔌 بسته شد")
+    elif t == "term":
+        if not s:
+            return await ssh_menu(u, c)
+        old = s.mid
+        m = await u.effective_message.reply_text("⏳")
+        s.mid, s.last = m.message_id, ""
+        try:
+            await c.bot.delete_message(s.chat, old)
+        except Exception:
+            pass
+        await push(s, force=True)
+    elif t == "snip":
+        if not s:
+            return
+        rows = [[B(x["name"], callback_data=f"x:sr:{i}")] for i, x in enumerate(DB["snippets"])]
+        await u.effective_message.reply_text("📜 یک Snippet انتخاب کن:", reply_markup=KM(rows or None))
+    elif t == "sr":
+        if s:
+            await term_send(s, DB["snippets"][int(r[0])]["cmd"] + "\r")
+
+
+async def on_get(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not ok(u):
+        return
+    s = SESS.get(u.effective_user.id)
+    path = " ".join(c.args or [])
+    if not s or not path:
+        return await u.message.reply_text("ابتدا به یک سرور وصل شو. استفاده: /get مسیر_فایل")
+    try:
+        async with s.conn.start_sftp_client() as sftp:
+            size = (await sftp.stat(path)).size or 0
+            if size > 50 * 1024 * 1024:
+                return await u.message.reply_text("❌ حداکثر حجم 50MB")
+            async with sftp.open(path, "rb") as fh:
+                data = await fh.read()
+        await u.message.reply_document(io.BytesIO(data), filename=os.path.basename(path) or "file")
+    except Exception as ex:
+        await u.message.reply_text(f"❌ {ex}")
+
+
+async def on_ls(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not ok(u):
+        return
+    s = SESS.get(u.effective_user.id)
+    if not s:
+        return await u.message.reply_text("ابتدا به یک سرور وصل شو.")
+    path = " ".join(c.args or []) or "."
+    try:
+        async with s.conn.start_sftp_client() as sftp:
+            full = str(await sftp.realpath(path))
+            items = [x for x in await sftp.readdir(path) if x.filename not in (".", "..")]
+        items.sort(key=lambda x: (not pystat.S_ISDIR(x.attrs.permissions or 0), str(x.filename).lower()))
+        lines = [f"{'📁' if pystat.S_ISDIR(x.attrs.permissions or 0) else '📄'} {x.filename}"
+                 + ("" if pystat.S_ISDIR(x.attrs.permissions or 0) else f"  ({hb(x.attrs.size or 0)})") for x in items]
+        txt = f"<b>{e(full)}</b>\n<pre>{e(chr(10).join(lines)) or '(خالی)'}</pre>"
+        await u.message.reply_text(txt[:4000], parse_mode="HTML")
+    except Exception as ex:
+        await u.message.reply_text(f"❌ {ex}")
+
+
+async def on_doc(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not ok(u):
+        return
+    s = SESS.get(u.effective_user.id)
+    if not s:
+        return
+    d = u.message.document
+    if d.file_size and d.file_size > 20 * 1024 * 1024:
+        return await u.message.reply_text("❌ حداکثر حجم آپلود 20MB")
+    dest = (u.message.caption or ".").strip()
+    try:
+        f = await d.get_file()
+        data = bytes(await f.download_as_bytearray())
+        async with s.conn.start_sftp_client() as sftp:
+            if await sftp.isdir(dest):
+                dest = dest.rstrip("/") + "/" + (d.file_name or "upload.bin")
+            async with sftp.open(dest, "wb") as fh:
+                await fh.write(data)
+            full = str(await sftp.realpath(dest))
+        await u.message.reply_text(f"✅ آپلود شد: {full}")
+    except Exception as ex:
+        await u.message.reply_text(f"❌ {ex}")
+
+
+SSH_KINDS = {"hhost", "huser", "hpw", "hpaste", "kpaste", "snname", "sncmd", "mxcmd"}
+
+
 async def on_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not ok(u):
         return await u.message.reply_text(f"⛔ دسترسی نداری. آیدی تو: {u.effective_user.id}")
@@ -1324,8 +1479,10 @@ async def on_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler(["start", "menu"], on_start))
+    app.add_handler(CommandHandler("get", on_get))
+    app.add_handler(CommandHandler("ls", on_ls))
+    app.add_handler(MessageHandler(filters.Document.ALL, on_doc))
     app.add_handler(CallbackQueryHandler(on_cb))
-    app.add_handler(MessageHandler(filters.Document.ALL, on_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     log.info("Bot started. Projects: %s", ", ".join(APIS))
     app.run_polling()
